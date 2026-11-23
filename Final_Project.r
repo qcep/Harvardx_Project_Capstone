@@ -1,0 +1,621 @@
+# =============================================================================
+# main.R
+# Project: Micro Gas Turbine Electrical Power Prediction
+# Unified pipeline (replaces 00_setup.R, functions.R, 01..06)
+#
+# USAGE
+#   setwd("path/to/project")   # folder containing train_ex_*.csv / test_ex_*.csv
+#   source("main.R")           # runs the full pipeline
+#   # or run selected steps:
+#   RUN_STEPS <- c("setup","load","eda","features","cv_split","models","final_eval")
+#   source("main.R")
+#
+# OUTPUTS (project root)
+#   all_experiments.rds, features_data.rds, train_data.rds, cv_folds.rds
+#   tbl_eda_summary.csv, tbl_cv_results.csv, tbl_cv_by_experiment.csv,
+#   tbl_best_params.rds, tbl_final_results.csv, tbl_final_by_experiment.csv
+#   model_lm_base.rds, model_lm_lags.rds, model_rf.rds, model_xgb.json
+#   fig_01..fig_06 (.png)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# SECTION 0: SETUP (packages, seed, constants)
+# -----------------------------------------------------------------------------
+
+step_00_setup <- function() {
+
+  required_packages <- c(
+    "tidyverse", "caret", "randomForest", "ranger", "xgboost",
+    "zoo", "scales", "patchwork", "knitr", "kableExtra", "rmarkdown"
+  )
+
+  installed <- installed.packages()[, "Package"]
+  missing   <- setdiff(required_packages, installed)
+  if (length(missing) > 0) {
+    message("Installing missing packages: ", paste(missing, collapse = ", "))
+    install.packages(missing, dependencies = TRUE,
+                     repos = "https://cloud.r-project.org")
+  } else {
+    message("All required packages are already installed.")
+  }
+  invisible(lapply(required_packages, library, character.only = TRUE))
+
+  SEED <<- 123
+  set.seed(SEED)
+  options(scipen = 999, dplyr.summarise.inform = FALSE)
+
+  # Experiment split (following Bielski et al., 2024)
+  TRAIN_EXPERIMENTS   <<- c(1, 9, 20, 21, 23, 24)
+  HOLDOUT_EXPERIMENTS <<- c(4, 22)
+
+  RAW_FILES <<- c(
+    setNames(sprintf("train_ex_%d.csv", TRAIN_EXPERIMENTS),   TRAIN_EXPERIMENTS),
+    setNames(sprintf("test_ex_%d.csv",  HOLDOUT_EXPERIMENTS), HOLDOUT_EXPERIMENTS)
+  )
+
+  # Output files
+  FILE_ALL_DATA   <<- "all_experiments.rds"
+  FILE_FEATURES   <<- "features_data.rds"
+  FILE_CV_RESULTS <<- "tbl_cv_results.csv"
+  FILE_FINAL      <<- "tbl_final_results.csv"
+
+  # Feature engineering parameters (lags are ROWS back, not exact seconds)
+  LAGS           <<- c(1, 2, 5, 10, 20, 30, 60, 120, 180, 300, 450, 600)
+  ROLL_WINDOWS   <<- c(10, 30, 60, 120, 300, 600)
+  JUMP_THRESHOLD <<- 1   # volts; a voltage change larger than this counts as a "jump"
+
+  message("Step 00 completed: environment ready (seed = ", SEED, ").")
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 1: HELPER FUNCTIONS (metrics, features, folds, theme)
+# -----------------------------------------------------------------------------
+
+# --- 1.1 Metrics -----------------------------------------------------------
+
+rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+mae  <- function(actual, predicted) mean(abs(actual - predicted), na.rm = TRUE)
+r2   <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2, na.rm = TRUE) /
+      sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+}
+eval_metrics <- function(actual, predicted, model_name = NA_character_) {
+  tibble(model = model_name, RMSE = rmse(actual, predicted),
+         MAE = mae(actual, predicted), R2 = r2(actual, predicted))
+}
+
+# --- 1.2 Feature engineering ----------------------------------------------
+
+make_lags <- function(x, lags = LAGS, prefix = "v_lag_") {
+  out <- lapply(lags, function(l) dplyr::lag(x, l))
+  names(out) <- paste0(prefix, lags)
+  as_tibble(out)
+}
+
+make_roll_mean <- function(x, windows = ROLL_WINDOWS, prefix = "v_rmean_") {
+  out <- lapply(windows, function(w)
+    zoo::rollapplyr(x, width = w, FUN = mean, fill = NA, partial = FALSE))
+  names(out) <- paste0(prefix, windows)
+  as_tibble(out)
+}
+
+make_roll_sd <- function(x, windows = ROLL_WINDOWS, prefix = "v_rsd_") {
+  out <- lapply(windows, function(w)
+    zoo::rollapplyr(x, width = w, FUN = sd, fill = NA, partial = FALSE))
+  names(out) <- paste0(prefix, windows)
+  as_tibble(out)
+}
+
+# Jump-based features for ONE experiment (kept separate for clarity)
+add_jump_features <- function(df) {
+  df  <- df %>% arrange(time)
+  v   <- df$input_voltage
+  n   <- length(v)
+  idx <- seq_len(n)
+  jump <- c(FALSE, abs(diff(v)) > JUMP_THRESHOLD)
+
+  last_jump <- zoo::na.locf(ifelse(jump, idx, NA), na.rm = FALSE)
+  last_jump[is.na(last_jump)] <- 1
+
+  v_before <- zoo::na.locf(ifelse(jump, dplyr::lag(v), NA), na.rm = FALSE)
+  v_before[is.na(v_before)] <- v[1]
+
+  df %>% mutate(
+    rows_since_jump = idx - last_jump,
+    v_before_jump   = v_before,
+    v_jump_size     = v - v_before
+  )
+}
+
+# All features for ONE experiment: lags + rolling + jumps
+build_features_one <- function(df) {
+  df <- df %>% arrange(time)
+  v  <- df$input_voltage
+  df %>%
+    bind_cols(
+      tibble(v_diff_1 = v - dplyr::lag(v, 1)),
+      make_lags(v),
+      make_roll_mean(v),
+      make_roll_sd(v)
+    ) %>%
+    add_jump_features()
+}
+
+# Applies build_features_one() to every experiment, preserving order
+build_features <- function(data) {
+  data %>%
+    group_split(experiment) %>%
+    lapply(build_features_one) %>%
+    bind_rows() %>%
+    arrange(experiment, time)
+}
+
+# --- 1.3 Cross-validation by experiment -----------------------------------
+
+make_experiment_folds <- function(data) {
+  exps <- sort(unique(data$experiment))
+  lapply(setNames(exps, paste0("Fold_exp_", exps)), function(e) {
+    list(train      = which(data$experiment != e),
+         validation = which(data$experiment == e))
+  })
+}
+
+# --- 1.4 Plot theme --------------------------------------------------------
+
+theme_project <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(plot.title       = element_text(face = "bold"),
+          plot.subtitle    = element_text(color = "grey40"),
+          legend.position  = "bottom",
+          panel.grid.minor = element_blank())
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 2: LOAD AND VALIDATE DATA
+# -----------------------------------------------------------------------------
+
+step_01_load_data <- function() {
+
+  missing_files <- RAW_FILES[!file.exists(RAW_FILES)]
+  if (length(missing_files) > 0)
+    stop("Missing files in project folder: ", paste(missing_files, collapse = ", "))
+  message("Step 01: all 8 CSV files found.")
+
+  load_experiment <- function(file, exp_id) {
+    readr::read_csv(file, show_col_types = FALSE) %>%
+      mutate(experiment = as.integer(exp_id),
+             split = if_else(exp_id %in% HOLDOUT_EXPERIMENTS,
+                             "holdout", "train"))
+  }
+
+  all_data <- purrr::map2_dfr(
+    unname(RAW_FILES), as.integer(names(RAW_FILES)),
+    load_experiment, .id = NULL
+  )
+
+  expected_cols <- c("time", "input_voltage", "el_power", "experiment", "split")
+  if (!all(expected_cols %in% names(all_data)))
+    stop("Unexpected columns. Found: ", paste(names(all_data), collapse = ", "))
+
+  print(colSums(is.na(all_data)))
+
+  summary_exp <- all_data %>%
+    group_by(experiment, split) %>%
+    summarise(n_rows = n(), time_min = min(time), time_max = max(time),
+              voltage_min = min(input_voltage), voltage_max = max(input_voltage),
+              power_min = min(el_power), power_max = max(el_power),
+              .groups = "drop") %>%
+    arrange(experiment)
+  print(summary_exp)
+  message("Total rows: ", nrow(all_data), " (expected 71225)")
+
+  all_data %>% arrange(experiment, time) %>% saveRDS(FILE_ALL_DATA)
+  message("Step 01 completed: saved ", FILE_ALL_DATA)
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 3: EXPLORATORY DATA ANALYSIS
+# -----------------------------------------------------------------------------
+
+step_02_eda <- function() {
+
+  all_data <- readRDS(FILE_ALL_DATA) %>%
+    mutate(experiment = factor(experiment, levels = sort(unique(experiment))))
+
+  print(all_data %>%
+          group_by(experiment) %>%
+          summarise(dt_median = median(diff(time)), dt_max = max(diff(time)),
+                    .groups = "drop"))
+
+  eda_summary <- all_data %>%
+    group_by(experiment, split) %>%
+    summarise(n_rows = n(), duration_h = (max(time) - min(time)) / 3600,
+              voltage_n_chg    = sum(diff(input_voltage) != 0),
+              voltage_max_jump = max(abs(diff(input_voltage))),
+              power_mean = mean(el_power), power_sd = sd(el_power),
+              .groups = "drop")
+  print(eda_summary)
+  write_csv(eda_summary, "tbl_eda_summary.csv")
+
+  # Figure 1: time series
+  p1 <- all_data %>%
+    pivot_longer(c(input_voltage, el_power),
+                 names_to = "variable", values_to = "value") %>%
+    mutate(variable = recode(variable,
+             input_voltage = "Input voltage (V)",
+             el_power      = "Electrical power (W)")) %>%
+    ggplot(aes(time, value, color = variable)) +
+    geom_line(show.legend = FALSE) +
+    facet_grid(variable ~ experiment, scales = "free",
+               labeller = labeller(experiment = label_both)) +
+    labs(title = "Control voltage and power output by experiment",
+         x = "Time (s)", y = NULL) +
+    theme_project(base_size = 9)
+  ggsave("fig_01_time_series.png", p1, width = 14, height = 5, dpi = 150)
+
+  # Figure 2: voltage vs power
+  p2 <- ggplot(all_data, aes(input_voltage, el_power, color = split)) +
+    geom_point(alpha = 0.15, size = 0.6) +
+    labs(title = "Voltage vs electrical power",
+         subtitle = "Scatter around the main curve reflects transition delays",
+         x = "Input voltage (V)", y = "Electrical power (W)", color = "Split") +
+    theme_project()
+  ggsave("fig_02_voltage_vs_power.png", p2, width = 7, height = 5, dpi = 150)
+
+  # Figure 3: delay zoom (largest jump in experiment 1)
+  exp1 <- all_data %>% filter(experiment == 1) %>% arrange(time)
+  jump_idx <- which.max(abs(diff(exp1$input_voltage))) + 1
+  win <- exp1[max(1, jump_idx - 300):min(nrow(exp1), jump_idx + 300), ]
+  p3 <- win %>%
+    mutate(power_scaled   = (el_power - min(el_power)) /
+             (max(el_power) - min(el_power)),
+           voltage_scaled = (input_voltage - min(input_voltage)) /
+             (max(input_voltage) - min(input_voltage))) %>%
+    select(time, voltage_scaled, power_scaled) %>%
+    pivot_longer(-time) %>%
+    mutate(name = recode(name, voltage_scaled = "Voltage (scaled)",
+                               power_scaled   = "Power (scaled)")) %>%
+    ggplot(aes(time, value, color = name)) +
+    geom_line(linewidth = 0.9) +
+    labs(title = "System delay around the largest voltage change (exp 1)",
+         x = "Time (s)", y = "Scaled value (0-1)", color = NULL) +
+    theme_project()
+  ggsave("fig_03_delay_zoom.png", p3, width = 8, height = 4.5, dpi = 150)
+
+  # Figure 4: cross-correlation
+  ccf_df <- all_data %>%
+    group_by(experiment) %>%
+    group_modify(~ {
+      cc <- ccf(.x$el_power, .x$input_voltage, lag.max = 120, plot = FALSE)
+      tibble(lag = as.numeric(cc$lag), corr = as.numeric(cc$acf))
+    }) %>%
+    filter(lag >= 0)
+  print(ccf_df %>% group_by(experiment) %>% slice_max(corr, n = 1))
+
+  p4 <- ggplot(ccf_df, aes(lag, corr, color = experiment)) +
+    geom_line() +
+    labs(title = "Cross-correlation: power at t+k vs voltage at t",
+         subtitle = "The peak indicates how long power takes to respond",
+         x = "Lag k (seconds)", y = "Correlation", color = "Experiment") +
+    theme_project()
+  ggsave("fig_04_cross_correlation.png", p4, width = 8, height = 4.5, dpi = 150)
+
+  message("Step 02 completed: figures and summary saved.")
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 4: FEATURE ENGINEERING
+# -----------------------------------------------------------------------------
+
+step_03_features <- function() {
+
+  all_data <- readRDS(FILE_ALL_DATA)
+
+  features_all <- build_features(all_data)
+
+  rows_before <- features_all %>% count(experiment, name = "n_before")
+  features_data <- features_all %>% tidyr::drop_na()
+  rows_after  <- features_data %>% count(experiment, name = "n_after")
+
+  print(left_join(rows_before, rows_after, by = "experiment") %>%
+          mutate(n_lost = n_before - n_after,
+                 pct_lost = round(100 * n_lost / n_before, 1)))
+
+  feature_cols <- setdiff(names(features_data),
+                          c("time", "el_power", "experiment", "split"))
+  message("Number of predictors: ", length(feature_cols))
+  print(feature_cols)
+
+  stopifnot(sum(is.na(features_data)) == 0)
+
+  saveRDS(features_data, FILE_FEATURES)
+  message("Step 03 completed: saved ", FILE_FEATURES)
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 5: TRAIN / HOLDOUT SPLIT AND CV FOLDS
+# -----------------------------------------------------------------------------
+
+step_04_cv_split <- function() {
+
+  features_data <- readRDS(FILE_FEATURES)
+
+  train_data <- features_data %>%
+    filter(experiment %in% TRAIN_EXPERIMENTS) %>%
+    arrange(experiment, time)
+  stopifnot(!any(train_data$experiment %in% HOLDOUT_EXPERIMENTS))
+  message("Training rows: ", nrow(train_data), " | experiments: ",
+          paste(sort(unique(train_data$experiment)), collapse = ", "))
+
+  cv_folds <- make_experiment_folds(train_data)
+
+  fold_check <- purrr::imap_dfr(cv_folds, function(f, name) {
+    tibble(fold = name, n_train = length(f$train),
+           n_validation = length(f$validation),
+           val_exp = paste(unique(train_data$experiment[f$validation]), collapse = ","),
+           overlap = length(intersect(f$train, f$validation)),
+           exp_in_both = length(intersect(
+             unique(train_data$experiment[f$train]),
+             unique(train_data$experiment[f$validation]))))
+  })
+  print(fold_check)
+  stopifnot(all(fold_check$overlap == 0), all(fold_check$exp_in_both == 0))
+
+  saveRDS(train_data, "train_data.rds")
+  saveRDS(cv_folds,   "cv_folds.rds")
+  message("Step 04 completed: saved train_data.rds and cv_folds.rds")
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 6: MODELS + CV COMPARISON (hold-out untouched)
+# -----------------------------------------------------------------------------
+
+step_05_models <- function() {
+
+  train_data <- readRDS("train_data.rds")
+  cv_folds   <- readRDS("cv_folds.rds")
+  stopifnot(!any(train_data$experiment %in% HOLDOUT_EXPERIMENTS))
+
+  target       <- "el_power"
+  feature_cols <- setdiff(names(train_data),
+                          c("time", "el_power", "experiment", "split"))
+  N_THREADS    <- max(1, parallel::detectCores() - 1)
+
+  RECTANGULAR <- c(1, 20, 21, 23)   # from EDA (fig_04)
+  CONTINUOUS  <- c(9, 24)
+
+  # --- fit-and-predict functions --------------------------------------------
+  fit_lm_base <- function(tr, va, p = NULL) {
+    predict(lm(el_power ~ input_voltage, data = tr), newdata = va)
+  }
+  fit_lm_lags <- function(tr, va, p = NULL) {
+    predict(lm(reformulate(feature_cols, target), data = tr), newdata = va)
+  }
+  fit_rf <- function(tr, va, p) {
+    m <- ranger::ranger(
+      reformulate(feature_cols, target), data = tr,
+      num.trees = 300, mtry = p$mtry, min.node.size = p$min.node.size,
+      num.threads = N_THREADS, seed = SEED)
+    predict(m, data = va)$predictions
+  }
+  fit_xgb <- function(tr, va, p) {
+    dtr <- xgboost::xgb.DMatrix(as.matrix(tr[, feature_cols]), label = tr[[target]])
+    m <- xgboost::xgb.train(
+      params = list(objective = "reg:squarederror",
+                    max_depth = p$max_depth, eta = p$eta,
+                    subsample = 0.8, colsample_bytree = 0.8,
+                    nthread = N_THREADS, seed = SEED),
+      data = dtr, nrounds = p$nrounds, verbose = 0)
+    predict(m, as.matrix(va[, feature_cols]))
+  }
+
+  # --- CV runner ------------------------------------------------------------
+  run_cv <- function(fit_fun, params = NULL, model_name) {
+    purrr::imap_dfr(cv_folds, function(f, fold_name) {
+      tr <- train_data[f$train, ]
+      va <- train_data[f$validation, ]
+      pred <- fit_fun(tr, va, params)
+      tibble(model = model_name, experiment = unique(va$experiment),
+             RMSE = rmse(va[[target]], pred),
+             MAE  = mae(va[[target]], pred),
+             R2   = r2(va[[target]], pred))
+    })
+  }
+
+  # --- baselines ------------------------------------------------------------
+  message("Running linear models...")
+  cv_lm_base <- run_cv(fit_lm_base, model_name = "LM (voltage only)")
+  cv_lm_lags <- run_cv(fit_lm_lags, model_name = "LM (all features)")
+
+  # --- tuning ---------------------------------------------------------------
+  tune_model <- function(fit_fun, grid, label) {
+    results <- lapply(seq_len(nrow(grid)), function(i) {
+      p <- as.list(grid[i, ])
+      message(label, " config ", i, "/", nrow(grid), ": ",
+              paste(names(p), unlist(p), sep = "=", collapse = ", "))
+      cv <- run_cv(fit_fun, p, label)
+      list(params = p, cv = cv, mean_rmse = mean(cv$RMSE))
+    })
+    best <- which.min(sapply(results, `[[`, "mean_rmse"))
+    message(label, " best config: ", best, " | mean RMSE = ",
+            round(results[[best]]$mean_rmse, 2))
+    results[[best]]
+  }
+
+  grid_rf  <- expand.grid(mtry = c(10, 20), min.node.size = c(5, 50))
+  grid_xgb <- expand.grid(max_depth = c(4, 6), eta = c(0.05, 0.1), nrounds = 300)
+
+  best_rf  <- tune_model(fit_rf,  grid_rf,  "Random Forest")
+  best_xgb <- tune_model(fit_xgb, grid_xgb, "XGBoost")
+
+  # --- results --------------------------------------------------------------
+  cv_by_experiment <- bind_rows(cv_lm_base, cv_lm_lags,
+                                best_rf$cv, best_xgb$cv) %>%
+    mutate(type = if_else(experiment %in% RECTANGULAR,
+                          "rectangular", "continuous"))
+
+  cv_summary <- cv_by_experiment %>%
+    group_by(model) %>%
+    summarise(RMSE_mean        = mean(RMSE),
+              RMSE_rectangular = mean(RMSE[type == "rectangular"]),
+              RMSE_continuous  = mean(RMSE[type == "continuous"]),
+              MAE_mean         = mean(MAE),
+              R2_mean          = mean(R2), .groups = "drop") %>%
+    arrange(RMSE_mean)
+
+  print(cv_summary)
+  print(cv_by_experiment %>% select(model, experiment, RMSE) %>%
+          pivot_wider(names_from = experiment, values_from = RMSE))
+
+  write_csv(cv_summary,       FILE_CV_RESULTS)
+  write_csv(cv_by_experiment, "tbl_cv_by_experiment.csv")
+  saveRDS(list(rf = best_rf$params, xgb = best_xgb$params), "tbl_best_params.rds")
+
+  # --- final models on all training experiments ----------------------------
+  message("Training final models on all training experiments...")
+  final_lm_base <- lm(el_power ~ input_voltage, data = train_data)
+  final_lm_lags <- lm(reformulate(feature_cols, target), data = train_data)
+  final_rf <- ranger::ranger(
+    reformulate(feature_cols, target), data = train_data,
+    num.trees = 500, mtry = best_rf$params$mtry,
+    min.node.size = best_rf$params$min.node.size,
+    importance = "permutation", num.threads = N_THREADS, seed = SEED)
+  final_xgb <- xgboost::xgb.train(
+    params = list(objective = "reg:squarederror",
+                  max_depth = best_xgb$params$max_depth,
+                  eta = best_xgb$params$eta,
+                  subsample = 0.8, colsample_bytree = 0.8,
+                  nthread = N_THREADS, seed = SEED),
+    data = xgboost::xgb.DMatrix(
+      as.matrix(train_data[, feature_cols]), label = train_data[[target]]),
+    nrounds = best_xgb$params$nrounds, verbose = 0)
+
+  saveRDS(final_lm_base, "model_lm_base.rds")
+  saveRDS(final_lm_lags, "model_lm_lags.rds")
+  saveRDS(final_rf,      "model_rf.rds")
+  xgboost::xgb.save(final_xgb, "model_xgb.json")
+
+  message("Step 05 completed: tables and models saved.")
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 7: FINAL EVALUATION ON HOLD-OUT (run once)
+# -----------------------------------------------------------------------------
+
+step_06_final_eval <- function() {
+
+  target <- "el_power"
+
+  train_data   <- readRDS("train_data.rds")
+  feature_cols <- setdiff(names(train_data),
+                          c("time", "el_power", "experiment", "split"))
+
+  holdout <- readRDS(FILE_FEATURES) %>%
+    filter(experiment %in% HOLDOUT_EXPERIMENTS) %>%
+    arrange(experiment, time)
+  stopifnot(all(sort(unique(holdout$experiment)) == sort(HOLDOUT_EXPERIMENTS)),
+            all(feature_cols %in% names(holdout)))
+  message("Hold-out rows: ", nrow(holdout), " | experiments: ",
+          paste(sort(unique(holdout$experiment)), collapse = ", "))
+
+  m_lm_base <- readRDS("model_lm_base.rds")
+  m_lm_lags <- readRDS("model_lm_lags.rds")
+  m_rf      <- readRDS("model_rf.rds")
+  m_xgb     <- xgboost::xgb.load("model_xgb.json")
+
+  preds <- holdout %>%
+    select(time, experiment, actual = all_of(target)) %>%
+    mutate(
+      `LM (voltage only)` = predict(m_lm_base, newdata = holdout),
+      `LM (all features)` = predict(m_lm_lags, newdata = holdout),
+      `Random Forest`     = predict(m_rf, data = holdout)$predictions,
+      `XGBoost`           = predict(m_xgb, as.matrix(holdout[, feature_cols]))
+    ) %>%
+    pivot_longer(-c(time, experiment, actual),
+                 names_to = "model", values_to = "pred")
+
+  final_by_experiment <- preds %>%
+    group_by(model, experiment) %>%
+    summarise(RMSE = rmse(actual, pred), MAE = mae(actual, pred),
+              R2 = r2(actual, pred), .groups = "drop") %>%
+    mutate(type = if_else(experiment == 4, "rectangular", "continuous"))
+
+  final_results <- preds %>%
+    group_by(model) %>%
+    summarise(RMSE_pooled = rmse(actual, pred),
+              MAE_pooled  = mae(actual, pred),
+              R2_pooled   = r2(actual, pred), .groups = "drop") %>%
+    left_join(final_by_experiment %>%
+                select(model, experiment, RMSE) %>%
+                pivot_wider(names_from = experiment, values_from = RMSE,
+                            names_prefix = "RMSE_exp_"),
+              by = "model") %>%
+    left_join(read_csv(FILE_CV_RESULTS, show_col_types = FALSE) %>%
+                select(model, RMSE_cv = RMSE_mean), by = "model") %>%
+    arrange(RMSE_pooled)
+
+  print(final_results)
+  print(final_by_experiment %>% arrange(experiment, RMSE))
+
+  write_csv(final_results,       FILE_FINAL)
+  write_csv(final_by_experiment, "tbl_final_by_experiment.csv")
+
+  # Figure 5
+  plot_df <- preds %>% filter(model %in% c("LM (voltage only)",
+                                           "Random Forest", "XGBoost"))
+  p5 <- ggplot(plot_df, aes(time)) +
+    geom_line(aes(y = actual), color = "black", linewidth = 0.6) +
+    geom_line(aes(y = pred, color = model), linewidth = 0.5, alpha = 0.85) +
+    facet_grid(model ~ experiment, scales = "free_x",
+               labeller = labeller(experiment = label_both)) +
+    labs(title = "Hold-out predictions (black = actual power)",
+         x = "Time (s)", y = "Electrical power (W)", color = "Model") +
+    theme_project(base_size = 10) + theme(legend.position = "none")
+  ggsave("fig_05_holdout_predictions.png", p5, width = 11, height = 7, dpi = 150)
+
+  # Figure 6
+  imp <- tibble(variable   = names(m_rf$variable.importance),
+                importance = as.numeric(m_rf$variable.importance)) %>%
+    slice_max(importance, n = 15)
+  p6 <- ggplot(imp, aes(importance, reorder(variable, importance))) +
+    geom_col(fill = "steelblue") +
+    labs(title = "Random Forest: top 15 predictors (permutation importance)",
+         x = "Importance", y = NULL) +
+    theme_project()
+  ggsave("fig_06_variable_importance.png", p6, width = 7, height = 5, dpi = 150)
+
+  message("Step 06 completed: final results saved.")
+}
+
+# -----------------------------------------------------------------------------
+# SECTION 8: PIPELINE RUNNER
+# -----------------------------------------------------------------------------
+
+# Run selected steps (in canonical order) from the current working directory.
+run_pipeline <- function(steps = c("setup","load","eda","features",
+                                   "cv_split","models","final_eval")) {
+  step_funs <- list(
+    setup      = step_00_setup,
+    load       = step_01_load_data,
+    eda        = step_02_eda,
+    features   = step_03_features,
+    cv_split   = step_04_cv_split,
+    models     = step_05_models,
+    final_eval = step_06_final_eval
+  )
+  stopifnot(all(steps %in% names(step_funs)))
+  for (s in steps) {
+    message("\n===== Running step: ", s, " =====")
+    step_funs[[s]]()
+  }
+  message("\nPipeline finished. Steps run: ", paste(steps, collapse = " -> "))
+}
+
+# -----------------------------------------------------------------------------
+# EXECUTION
+# -----------------------------------------------------------------------------
+# By default, run everything. Override RUN_STEPS before sourcing to run a subset.
+if (!exists("RUN_STEPS")) {
+  RUN_STEPS <- c("setup","load","eda","features","cv_split","models","final_eval")
+}
+run_pipeline(RUN_STEPS)
