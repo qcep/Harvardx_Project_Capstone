@@ -1,4 +1,4 @@
-$origen = "C:\Users\Eric Flores\Downloads\- Universidad\- EDX\Data Science - Capstone Project\Choose your own Project\micro_gas_turbine_elelectrical_energy_prediction"
+$origen = "C:\Users\x\Downloads\- Universidad\- EDX\Data Science - Capstone Project\Choose your own Project\micro_gas_turbine_elelectrical_energy_prediction"
 $tempRepo = "C:\Temp\Harvardx_Project_Capstone"
 
 if (!(Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" | Out-Null }
