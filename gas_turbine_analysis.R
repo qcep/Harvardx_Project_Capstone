@@ -4,7 +4,7 @@
 # Unified pipeline (replaces 00_setup.R, functions.R, 01..06)
 #
 # USAGE
-#   setwd("path/to/project")   # folder containing train_ex_*.csv / test_ex_*.csv
+#   setwd("path/to/project")   # working directory for outputs/models/figures
 #   source("main.R")           # runs the full pipeline
 #   # or run selected steps:
 #   RUN_STEPS <- c("setup","load","eda","features","cv_split","models","final_eval")
@@ -48,9 +48,15 @@ step_00_setup <- function() {
   TRAIN_EXPERIMENTS   <<- c(1, 9, 20, 21, 23, 24)
   HOLDOUT_EXPERIMENTS <<- c(4, 22)
 
+  # Dataset download URL and local/extracted paths
+  DATASET_URL      <<- "https://archive.ics.uci.edu/static/public/994/micro+gas+turbine+electrical+energy+prediction.zip"
+  DATA_CACHE_DIR   <<- file.path(tempdir(), "uci_994_micro_gas_turbine")
+  MAIN_ZIP_FILE    <<- file.path(DATA_CACHE_DIR, "micro+gas+turbine+electrical+energy+prediction.zip")
+  EXTRACTED_DIR    <<- file.path(DATA_CACHE_DIR, "extracted")
+
   RAW_FILES <<- c(
-    setNames(sprintf("train_ex_%d.csv", TRAIN_EXPERIMENTS),   TRAIN_EXPERIMENTS),
-    setNames(sprintf("test_ex_%d.csv",  HOLDOUT_EXPERIMENTS), HOLDOUT_EXPERIMENTS)
+    setNames(sprintf("train/ex_%d.csv", TRAIN_EXPERIMENTS),   TRAIN_EXPERIMENTS),
+    setNames(sprintf("test/ex_%d.csv",  HOLDOUT_EXPERIMENTS), HOLDOUT_EXPERIMENTS)
   )
 
   # Output files
@@ -176,9 +182,42 @@ theme_project <- function(base_size = 12) {
 
 step_01_load_data <- function() {
 
-  missing_files <- RAW_FILES[!file.exists(RAW_FILES)]
+  dir.create(DATA_CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
+  dir.create(EXTRACTED_DIR,  recursive = TRUE, showWarnings = FALSE)
+
+  if (!file.exists(MAIN_ZIP_FILE)) {
+    message("Step 01: downloading dataset zip from UCI repository...")
+    download.file(DATASET_URL, destfile = MAIN_ZIP_FILE, mode = "wb", quiet = TRUE)
+  }
+
+  unzip(MAIN_ZIP_FILE, exdir = EXTRACTED_DIR, overwrite = TRUE)
+
+  train_zips <- list.files(EXTRACTED_DIR, pattern = "^train\\.zip$",
+                           recursive = TRUE, full.names = TRUE)
+  test_zips  <- list.files(EXTRACTED_DIR, pattern = "^test\\.zip$",
+                           recursive = TRUE, full.names = TRUE)
+
+  if (length(train_zips) == 0 || length(test_zips) == 0) {
+    stop("Could not locate train.zip or test.zip inside downloaded archive.")
+  }
+
+  unzip(train_zips[1], exdir = EXTRACTED_DIR, overwrite = TRUE)
+  unzip(test_zips[1],  exdir = EXTRACTED_DIR, overwrite = TRUE)
+
+  resolved_files <- vapply(unname(RAW_FILES), function(rel_path) {
+    candidate <- file.path(EXTRACTED_DIR, rel_path)
+    if (file.exists(candidate)) {
+      candidate
+    } else {
+      matches <- list.files(EXTRACTED_DIR, pattern = paste0("^", basename(rel_path), "$"),
+                            recursive = TRUE, full.names = TRUE)
+      if (length(matches) > 0) matches[1] else candidate
+    }
+  }, character(1))
+
+  missing_files <- resolved_files[!file.exists(resolved_files)]
   if (length(missing_files) > 0)
-    stop("Missing files in project folder: ", paste(missing_files, collapse = ", "))
+    stop("Missing files after extracting archive: ", paste(missing_files, collapse = ", "))
   message("Step 01: all 8 CSV files found.")
 
   load_experiment <- function(file, exp_id) {
@@ -189,7 +228,7 @@ step_01_load_data <- function() {
   }
 
   all_data <- purrr::map2_dfr(
-    unname(RAW_FILES), as.integer(names(RAW_FILES)),
+    resolved_files, as.integer(names(RAW_FILES)),
     load_experiment, .id = NULL
   )
 
